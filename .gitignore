@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+Artifacts/
+Vendor/fff/target/
+*.xcframework.zip
+.DS_Store
+
