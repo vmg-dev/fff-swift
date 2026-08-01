@@ -414,6 +414,28 @@ struct FffResult *fff_create_instance2(const char *base_path,
                                        uint64_t cache_budget_max_file_size);
 
 /**
+ * Create a new file finder instance (v3).
+ *
+ * `include_binary_files` retains common binary file types in non-git indexes
+ * for filename and metadata search. Their contents remain excluded from
+ * content indexing.
+ */
+struct FffResult *fff_create_instance3(const char *base_path,
+                                       const char *frecency_db_path,
+                                       const char *history_db_path,
+                                       bool _use_unsafe_no_lock,
+                                       bool enable_mmap_cache,
+                                       bool enable_content_indexing,
+                                       bool watch,
+                                       bool ai_mode,
+                                       bool include_binary_files,
+                                       const char *log_file_path,
+                                       const char *log_level,
+                                       uint64_t cache_budget_max_files,
+                                       uint64_t cache_budget_max_bytes,
+                                       uint64_t cache_budget_max_file_size);
+
+/**
  * Destroy a file finder instance and free all its resources.
  *
  * ## Safety

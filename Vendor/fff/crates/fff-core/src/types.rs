@@ -81,6 +81,7 @@ pub struct DirFlags;
 
 impl DirFlags {
     pub const OVERFLOW: u8 = 1 << 0;
+    pub const DELETED: u8 = 1 << 1;
 }
 
 /// A directory in the file index. Shares chunk arena with file paths.
@@ -110,7 +111,12 @@ impl Clone for DirItem {
 impl DirItem {
     #[inline(always)]
     pub fn is_overflow(&self) -> bool {
-        self.flags & DirFlags::OVERFLOW == 0
+        self.flags & DirFlags::OVERFLOW != 0
+    }
+
+    #[inline(always)]
+    pub fn is_deleted(&self) -> bool {
+        self.flags & DirFlags::DELETED != 0
     }
 
     pub(crate) fn new(path: crate::simd_path::ChunkedString, last_segment_offset: u16) -> Self {
@@ -119,6 +125,26 @@ impl DirItem {
             flags: 0,
             last_segment_offset,
             max_access_frecency: AtomicI32::new(0),
+        }
+    }
+
+    pub(crate) fn new_overflow(
+        path: crate::simd_path::ChunkedString,
+        last_segment_offset: u16,
+    ) -> Self {
+        Self {
+            path,
+            flags: DirFlags::OVERFLOW,
+            last_segment_offset,
+            max_access_frecency: AtomicI32::new(0),
+        }
+    }
+
+    pub(crate) fn set_deleted(&mut self, deleted: bool) {
+        if deleted {
+            self.flags |= DirFlags::DELETED;
+        } else {
+            self.flags &= !DirFlags::DELETED;
         }
     }
 

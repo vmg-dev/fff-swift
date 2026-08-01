@@ -50,6 +50,7 @@ use crate::types::{
 use fff_query_parser::FFFQuery;
 use git2::{Repository, Status};
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -131,9 +132,13 @@ pub(crate) struct FileSync {
     files: Vec<FileItem>,
     indexable_count: usize,
     base_count: usize,
-    /// Sorted directory table. Each entry is a unique parent directory of at
-    /// least one file in `files`. Sorted by absolute path for O(log n) lookup.
+    /// Sorted directory table. Each entry is a unique parent directory or
+    /// ancestor of at least one file in `files`. Sorted by absolute path for
+    /// O(log n) lookup.
     dirs: Vec<DirItem>,
+    /// Number of scan-time directories in `dirs`. Incremental directories
+    /// live in the overflow arena and are appended after this boundary.
+    base_dir_count: usize,
     /// Shared builder for overflow file paths. Each overflow file's ChunkedString
     /// uses `arena_override` pointing into this builder's arena.
     overflow_builder: Option<crate::simd_path::ChunkedPathStoreBuilder>,
@@ -156,6 +161,7 @@ impl FileSync {
             indexable_count: 0,
             base_count: 0,
             dirs: Vec::new(),
+            base_dir_count: 0,
             overflow_builder: None,
             git_workdir: None,
             bigram_index: None,
@@ -247,8 +253,7 @@ impl FileSync {
         // Binary search dirs to find the parent directory index.
         // Dir items store the relative path including trailing '/' (e.g. "src/components/").
         let mut dir_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-        let dir_idx = match self
-            .dirs
+        let dir_idx = match self.dirs[..self.base_dir_count]
             .binary_search_by(|d| d.read_relative_path(arena, &mut dir_buf).cmp(dir_rel))
         {
             Ok(idx) => idx as u32,
@@ -292,41 +297,86 @@ impl FileSync {
             .map(|pos| self.base_count + pos)
     }
 
-    fn retain_files_with_arena<F>(&mut self, mut predicate: F) -> usize
-    where
-        F: FnMut(&FileItem, ArenaPtr) -> bool,
-    {
+    fn find_directory_index(&self, relative_path: &str) -> Option<usize> {
+        let base_arena = self.arena_base_ptr();
+        let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+        if let Ok(index) = self.dirs[..self.base_dir_count].binary_search_by(|dir| {
+            dir.read_relative_path(base_arena, &mut path_buf)
+                .cmp(relative_path)
+        }) {
+            return Some(index);
+        }
+
+        let overflow_arena = self.overflow_arena_ptr();
+        self.dirs[self.base_dir_count..]
+            .iter()
+            .position(|dir| dir.read_relative_path(overflow_arena, &mut path_buf) == relative_path)
+            .map(|position| self.base_dir_count + position)
+    }
+
+    fn ensure_directories_for_file(&mut self, relative_path: &str) -> u32 {
+        let filename_offset = relative_path
+            .rfind(std::path::is_separator)
+            .map_or(0, |index| index + 1);
+        let direct_parent = &relative_path[..filename_offset];
+        let mut directory_paths = Vec::new();
+        push_directory_and_ancestors(direct_parent, &mut directory_paths);
+
+        let mut direct_parent_index = u32::MAX;
+        for directory_path in directory_paths {
+            let index = if let Some(index) = self.find_directory_index(directory_path) {
+                self.dirs[index].set_deleted(false);
+                index
+            } else {
+                let path = self
+                    .overflow_builder
+                    .get_or_insert_with(|| crate::simd_path::ChunkedPathStoreBuilder::new(64))
+                    .add_dir_immediate(directory_path);
+                self.dirs.push(DirItem::new_overflow(
+                    path,
+                    directory_last_segment_offset(directory_path),
+                ));
+                self.dirs.len() - 1
+            };
+            if directory_path == direct_parent {
+                direct_parent_index = index as u32;
+            }
+        }
+        direct_parent_index
+    }
+
+    fn refresh_directory_liveness(&mut self) {
         let base_arena = self.arena_base_ptr();
         let overflow_arena = self.overflow_arena_ptr();
+        let mut live_directories = HashSet::new();
 
-        let indexable_count = self.indexable_count;
-        let base_count = self.base_count;
-        let initial_len = self.files.len();
+        for file in self.files.iter().filter(|file| !file.is_deleted()) {
+            let arena = if file.is_overflow() {
+                overflow_arena
+            } else {
+                base_arena
+            };
+            let relative_path = file.relative_path(arena);
+            let filename_offset = relative_path
+                .rfind(std::path::is_separator)
+                .map_or(0, |index| index + 1);
+            let direct_parent = &relative_path[..filename_offset];
+            let mut ancestors = Vec::new();
+            push_directory_and_ancestors(direct_parent, &mut ancestors);
+            live_directories.extend(ancestors.into_iter().map(str::to_owned));
+        }
 
-        let indexable_retained = self.files[..indexable_count]
-            .iter()
-            .filter(|f| predicate(f, base_arena))
-            .count();
-        let base_retained = self.files[indexable_count..base_count]
-            .iter()
-            .filter(|f| predicate(f, base_arena))
-            .count()
-            + indexable_retained;
-
-        self.files.retain(|f| {
-            predicate(
-                f,
-                if f.is_overflow() {
-                    overflow_arena
-                } else {
-                    base_arena
-                },
-            )
-        });
-
-        self.indexable_count = indexable_retained;
-        self.base_count = base_retained;
-        initial_len - self.files.len()
+        let base_dir_count = self.base_dir_count;
+        for (index, directory) in self.dirs.iter_mut().enumerate() {
+            let arena = if index < base_dir_count {
+                base_arena
+            } else {
+                overflow_arena
+            };
+            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+            let path = directory.read_relative_path(arena, &mut path_buf);
+            directory.set_deleted(!live_directories.contains(path));
+        }
     }
 }
 
@@ -467,6 +517,7 @@ pub struct FilePicker {
     scanned_files_count: Arc<AtomicUsize>,
     enable_mmap_cache: bool,
     enable_content_indexing: bool,
+    include_binary_files: bool,
     watch: bool,
 }
 
@@ -515,6 +566,10 @@ impl FilePicker {
 
     pub fn has_content_indexing(&self) -> bool {
         self.enable_content_indexing
+    }
+
+    pub fn includes_binary_files(&self) -> bool {
+        self.include_binary_files
     }
 
     pub fn has_watcher(&self) -> bool {
@@ -707,6 +762,7 @@ impl FilePicker {
             sync_data: FileSync::new(),
             enable_mmap_cache: options.enable_mmap_cache,
             enable_content_indexing: options.enable_content_indexing,
+            include_binary_files: false,
             watch: options.watch,
         })
     }
@@ -718,18 +774,33 @@ impl FilePicker {
         shared_frecency: SharedFrecency,
         options: FilePickerOptions,
     ) -> Result<(), Error> {
-        let picker = Self::new(options)?;
+        Self::new_with_shared_state_and_binary_files(shared_picker, shared_frecency, options, false)
+    }
+
+    /// Create a picker while choosing whether known binary file types are
+    /// retained in non-git indexes. Binary files remain excluded from content
+    /// indexing; this only makes their names and metadata searchable.
+    pub fn new_with_shared_state_and_binary_files(
+        shared_picker: SharedFilePicker,
+        shared_frecency: SharedFrecency,
+        options: FilePickerOptions,
+        include_binary_files: bool,
+    ) -> Result<(), Error> {
+        let mut picker = Self::new(options)?;
+        picker.include_binary_files = include_binary_files;
 
         info!(
-            "Spawning background threads: base_path={}, warmup={}, content_indexing={}, mode={:?}",
+            "Spawning background threads: base_path={}, warmup={}, content_indexing={}, include_binary_files={}, mode={:?}",
             picker.base_path.display(),
             picker.enable_mmap_cache,
             picker.enable_content_indexing,
+            picker.include_binary_files,
             picker.mode,
         );
 
         let warmup = picker.enable_mmap_cache;
         let content_indexing = picker.enable_content_indexing;
+        let include_binary_files = picker.include_binary_files;
         let watch = picker.watch;
         let mode = picker.mode;
 
@@ -756,6 +827,7 @@ impl FilePicker {
             ScanConfig {
                 warmup,
                 content_indexing,
+                include_binary_files,
                 watch,
                 auto_cache_budget: true,
                 install_watcher: true,
@@ -788,6 +860,7 @@ impl FilePicker {
             &self.scanned_files_count,
             &empty_frecency,
             self.mode,
+            self.include_binary_files,
         )?;
 
         self.sync_data = sync;
@@ -982,10 +1055,16 @@ impl FilePicker {
         };
 
         let arena = self.sync_data.arena_base_ptr();
+        let overflow_arena = self.sync_data.overflow_arena_ptr();
         let time = std::time::Instant::now();
 
-        let (items, scores, total_matched) =
-            crate::score::fuzzy_match_and_score_dirs(dirs, &context, arena);
+        let (items, scores, total_matched) = crate::score::fuzzy_match_and_score_dirs(
+            dirs,
+            &context,
+            self.sync_data.base_dir_count,
+            arena,
+            overflow_arena,
+        );
 
         info!(
             ?query,
@@ -1447,6 +1526,7 @@ impl FilePicker {
             FileItem::new(path_for_index.to_path_buf(), &self.base_path, None);
 
         // Lazily create the shared overflow builder if not exists yet
+        let parent_dir_index = self.sync_data.ensure_directories_for_file(&rel_path);
         let builder = self
             .sync_data
             .overflow_builder
@@ -1454,6 +1534,7 @@ impl FilePicker {
 
         let chunked_path = builder.add_file_immediate(&rel_path, file_item.path.filename_offset);
         file_item.set_path(chunked_path);
+        file_item.set_parent_dir(parent_dir_index);
         file_item.set_overflow(true);
 
         self.sync_data.files.push(file_item);
@@ -1463,7 +1544,7 @@ impl FilePicker {
     /// Tombstone a file instead of removing it, keeping base indices stable.
     pub fn remove_file_by_path(&mut self, path: impl AsRef<Path>) -> bool {
         let path = path.as_ref();
-        match self.sync_data.find_file_index(path, &self.base_path) {
+        let removed = match self.sync_data.find_file_index(path, &self.base_path) {
             Ok(index) => {
                 let file = &mut self.sync_data.files[index];
                 file.set_deleted(true);
@@ -1494,7 +1575,11 @@ impl FilePicker {
                     false
                 }
             }
+        };
+        if removed {
+            self.sync_data.refresh_directory_liveness();
         }
+        removed
     }
 
     // TODO make this O(n)
@@ -1511,9 +1596,47 @@ impl FilePicker {
             format!("{}{}", relative_dir, std::path::MAIN_SEPARATOR)
         };
 
-        self.sync_data.retain_files_with_arena(|file, arena| {
-            !file.relative_path_starts_with(arena, &dir_prefix)
-        })
+        let base_arena = self.sync_data.arena_base_ptr();
+        let overflow_arena = self.sync_data.overflow_arena_ptr();
+        let base_count = self.sync_data.base_count;
+        let overlay = self.sync_data.bigram_overlay.as_ref().map(Arc::clone);
+        let mut removed = 0;
+
+        // Base entries are referenced by stable positions in the content
+        // index. Tombstone them instead of compacting the vector, which would
+        // make every later bigram index point at the wrong file.
+        for index in 0..base_count {
+            let should_remove = {
+                let file = &self.sync_data.files[index];
+                !file.is_deleted() && file.relative_path_starts_with(base_arena, &dir_prefix)
+            };
+            if should_remove {
+                let file = &mut self.sync_data.files[index];
+                file.set_deleted(true);
+                file.git_status = None;
+                file.invalidate_mmap(&self.cache_budget);
+                if let Some(ref overlay) = overlay {
+                    overlay.write().delete_file(index);
+                }
+                removed += 1;
+            }
+        }
+
+        // Overflow entries are not referenced by the immutable base bigram
+        // index, so they can still be removed outright.
+        let initial_len = self.sync_data.files.len();
+        let mut index = 0;
+        self.sync_data.files.retain(|file| {
+            let keep =
+                index < base_count || !file.relative_path_starts_with(overflow_arena, &dir_prefix);
+            index += 1;
+            keep
+        });
+        removed += initial_len - self.sync_data.files.len();
+        if removed > 0 {
+            self.sync_data.refresh_directory_liveness();
+        }
+        removed
     }
 
     /// Use this to prevent any substantial background threads from acquiring the locks
@@ -1716,6 +1839,7 @@ impl FileSync {
         synced_files_count: &Arc<AtomicUsize>,
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
+        include_binary_files: bool,
     ) -> Result<FileSync, Error> {
         use ignore::WalkBuilder;
 
@@ -1768,7 +1892,7 @@ impl FileSync {
                         return ignore::WalkState::Continue;
                     }
 
-                    if !is_git_repo && is_known_binary_extension(path) {
+                    if !include_binary_files && !is_git_repo && is_known_binary_extension(path) {
                         return ignore::WalkState::Continue;
                     }
 
@@ -1882,11 +2006,13 @@ impl FileSync {
 
         let base_count = files.len();
 
+        let base_dir_count = dirs.len();
         Ok(FileSync {
             files,
             indexable_count,
             base_count,
             dirs,
+            base_dir_count,
             overflow_builder: None,
             git_workdir,
             bigram_index: None,
@@ -1898,48 +2024,82 @@ impl FileSync {
 
 /// This does both thing (yes sorry all the OOP morons)
 /// in one go: populates files chunked storage and creates new directories
-fn populates_dirs_files_chunked_storage<'a>(
-    pairs: &'a mut [(FileItem, String)],
+fn populates_dirs_files_chunked_storage(
+    pairs: &mut [(FileItem, String)],
     builder: &mut crate::simd_path::ChunkedPathStoreBuilder,
 ) -> Vec<DirItem> {
-    let mut dirs: Vec<DirItem> = Vec::new();
-
-    let mut prev_dir: &'a str = "";
-    let mut prev_dir_valid = false;
-    let mut current_dir_idx: u32 = 0;
-
-    for (file, rel) in pairs.iter_mut() {
-        let rel: &'a str = rel;
-        let dir_part: &'a str = &rel[..file.path.filename_offset as usize];
-
-        if !prev_dir_valid || prev_dir != dir_part {
-            let dir_string = builder.add_dir_immediate(dir_part);
-
-            // Compute last-segment offset: for "src/components/" -> 4 (points to "components/")
-            let last_seg = if dir_part.is_empty() {
-                0
-            } else {
-                let trimmed = dir_part.trim_end_matches(std::path::is_separator);
-                trimmed
-                    .rfind(std::path::is_separator)
-                    .map(|i| i + 1)
-                    .unwrap_or(0) as u16
-            };
-
-            dirs.push(DirItem::new(dir_string, last_seg));
-            current_dir_idx = (dirs.len() - 1) as u32;
-
-            prev_dir = dir_part;
-            prev_dir_valid = true;
+    // `pairs` is sorted by parent directory, so collect ancestors only once
+    // per distinct direct parent. Borrow the existing relative path strings;
+    // no path copies or per-directory String allocations are needed.
+    let mut dir_paths = Vec::with_capacity(pairs.len());
+    let mut previous_direct_parent: Option<&str> = None;
+    for (file, rel) in pairs.iter() {
+        let rel = rel.as_str();
+        let dir_part = &rel[..file.path.filename_offset as usize];
+        if previous_direct_parent != Some(dir_part) {
+            push_directory_and_ancestors(dir_part, &mut dir_paths);
+            previous_direct_parent = Some(dir_part);
         }
+    }
+    dir_paths.sort_unstable();
+    dir_paths.dedup();
 
+    let mut dirs = Vec::with_capacity(dir_paths.len());
+    for dir_part in &dir_paths {
+        let dir_string = builder.add_dir_immediate(dir_part);
+        // Compute last-segment offset: for "src/components/" -> 4 (points to "components/")
+        let last_seg = directory_last_segment_offset(dir_part);
+        dirs.push(DirItem::new(dir_string, last_seg));
+    }
+
+    let mut parent_indices = Vec::with_capacity(pairs.len());
+    let mut previous_direct_parent: Option<&str> = None;
+    let mut current_dir_idx = 0;
+    for (file, rel) in pairs.iter() {
+        let dir_part = &rel[..file.path.filename_offset as usize];
+        if previous_direct_parent != Some(dir_part) {
+            current_dir_idx = dir_paths
+                .binary_search(&dir_part)
+                .expect("every file parent is inserted into the directory table")
+                as u32;
+            previous_direct_parent = Some(dir_part);
+        }
+        parent_indices.push(current_dir_idx);
+    }
+    drop(dir_paths);
+
+    for ((file, rel), current_dir_idx) in pairs.iter_mut().zip(parent_indices) {
+        let rel = rel.as_str();
         let cs = builder.add_file_immediate(rel, file.path.filename_offset);
-
         file.set_path(cs);
         file.set_parent_dir(current_dir_idx);
     }
 
     dirs
+}
+
+fn push_directory_and_ancestors<'a>(dir_path: &'a str, output: &mut Vec<&'a str>) {
+    if dir_path.is_empty() {
+        output.push(dir_path);
+        return;
+    }
+
+    output.extend(
+        dir_path
+            .char_indices()
+            .filter(|(_, character)| std::path::is_separator(*character))
+            .map(|(index, _)| &dir_path[..=index]),
+    );
+}
+
+fn directory_last_segment_offset(directory_path: &str) -> u16 {
+    if directory_path.is_empty() {
+        return 0;
+    }
+    directory_path
+        .trim_end_matches(std::path::is_separator)
+        .rfind(std::path::is_separator)
+        .map_or(0, |index| index + 1) as u16
 }
 
 pub(crate) fn apply_git_status_and_frecency(
@@ -2159,10 +2319,8 @@ mod tests {
     use super::*;
 
     /// The watcher must watch every ancestor directory up to `base_path`,
-    /// not just the immediate parents of indexed files. Intermediate dirs
-    /// that contain only subdirectories (no direct files) are NOT in
-    /// `sync_data.dirs` — yet they must still appear in `extract_watch_dirs`
-    /// so Create events on new subdirectories below them fire.
+    /// not just the immediate parents of indexed files, so Create events on
+    /// new subdirectories below them fire.
     ///
     /// Correctness regression guard for any refactor that replaces the
     /// ancestor walk with a direct `sync_data.dirs` iteration.
@@ -2259,5 +2417,52 @@ mod tests {
         assert_eq!(common_dir_prefix_len("src", "src"), 0);
         // "src" is emitted-as-dir; "src/x" extends it — full "src" is shared.
         assert_eq!(common_dir_prefix_len("src", "src/x"), 3);
+    }
+
+    #[test]
+    fn directory_collection_includes_every_ancestor() {
+        let mut directories = Vec::new();
+        push_directory_and_ancestors("Downloads/Sample.app/Contents/MacOS/", &mut directories);
+
+        assert_eq!(
+            directories,
+            [
+                "Downloads/",
+                "Downloads/Sample.app/",
+                "Downloads/Sample.app/Contents/",
+                "Downloads/Sample.app/Contents/MacOS/",
+            ]
+        );
+    }
+
+    #[test]
+    fn binary_filename_indexing_is_opt_in_for_non_git_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"searchable text").unwrap();
+        std::fs::write(dir.path().join("download.pdf"), b"%PDF").unwrap();
+        std::fs::write(dir.path().join("photo.png"), b"\x89PNG").unwrap();
+
+        let options = || FilePickerOptions {
+            base_path: dir.path().to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        };
+
+        let mut default_picker = FilePicker::new(options()).unwrap();
+        default_picker.collect_files().unwrap();
+        assert_eq!(default_picker.get_files().len(), 1);
+
+        let mut desktop_picker = FilePicker::new(options()).unwrap();
+        desktop_picker.include_binary_files = true;
+        desktop_picker.collect_files().unwrap();
+        assert_eq!(desktop_picker.get_files().len(), 3);
+        assert_eq!(
+            desktop_picker
+                .get_files()
+                .iter()
+                .filter(|file| file.is_binary())
+                .count(),
+            2,
+        );
     }
 }

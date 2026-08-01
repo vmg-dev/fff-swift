@@ -147,6 +147,50 @@ pub unsafe extern "C" fn fff_create_instance(
 
 /// Create a new file finder instance (v2, with full options).
 ///
+/// Retained for ABI compatibility. Known binary file types are excluded from
+/// non-git roots, matching the historical FFF behavior. Use
+/// [`fff_create_instance3`] to make their filenames searchable.
+///
+/// ## Safety
+/// String parameters must be valid null-terminated UTF-8 or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_create_instance2(
+    base_path: *const c_char,
+    frecency_db_path: *const c_char,
+    history_db_path: *const c_char,
+    use_unsafe_no_lock: bool,
+    enable_mmap_cache: bool,
+    enable_content_indexing: bool,
+    watch: bool,
+    ai_mode: bool,
+    log_file_path: *const c_char,
+    log_level: *const c_char,
+    cache_budget_max_files: u64,
+    cache_budget_max_bytes: u64,
+    cache_budget_max_file_size: u64,
+) -> *mut FffResult {
+    unsafe {
+        fff_create_instance3(
+            base_path,
+            frecency_db_path,
+            history_db_path,
+            use_unsafe_no_lock,
+            enable_mmap_cache,
+            enable_content_indexing,
+            watch,
+            ai_mode,
+            false,
+            log_file_path,
+            log_level,
+            cache_budget_max_files,
+            cache_budget_max_bytes,
+            cache_budget_max_file_size,
+        )
+    }
+}
+
+/// Create a new file finder instance (v3, with binary filename indexing).
+///
 /// Returns an opaque pointer that must be passed to all other `fff_*` calls
 /// and eventually freed with `fff_destroy`.
 ///
@@ -164,6 +208,9 @@ pub unsafe extern "C" fn fff_create_instance(
 /// * `enable_content_indexing`     – build content index after the initial scan
 /// * `watch`                       – start a background file-system watcher for live updates
 /// * `ai_mode`                     – enable AI-agent optimizations
+/// * `include_binary_files`        – retain known binary file types in non-git
+///   indexes so their filenames and metadata can be searched. Their contents
+///   remain excluded from content indexing.
 /// * `log_file_path`               – tracing log file path (NULL/empty to skip).
 ///   Only the first successful call in a process installs the subscriber;
 ///   subsequent calls are no-ops at the log layer.
@@ -180,7 +227,7 @@ pub unsafe extern "C" fn fff_create_instance(
 /// ## Safety
 /// String parameters must be valid null-terminated UTF-8 or NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn fff_create_instance2(
+pub unsafe extern "C" fn fff_create_instance3(
     base_path: *const c_char,
     frecency_db_path: *const c_char,
     history_db_path: *const c_char,
@@ -189,6 +236,7 @@ pub unsafe extern "C" fn fff_create_instance2(
     enable_content_indexing: bool,
     watch: bool,
     ai_mode: bool,
+    include_binary_files: bool,
     log_file_path: *const c_char,
     log_level: *const c_char,
     cache_budget_max_files: u64,
@@ -261,7 +309,7 @@ pub unsafe extern "C" fn fff_create_instance2(
     );
 
     // Initialize file picker (writes directly into shared_picker)
-    if let Err(e) = FilePicker::new_with_shared_state(
+    if let Err(e) = FilePicker::new_with_shared_state_and_binary_files(
         shared_picker.clone(),
         shared_frecency.clone(),
         fff::FilePickerOptions {
@@ -272,6 +320,7 @@ pub unsafe extern "C" fn fff_create_instance2(
             mode,
             cache_budget,
         },
+        include_binary_files,
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
     }
@@ -902,23 +951,31 @@ pub unsafe extern "C" fn fff_restart_index(
         Err(e) => return FffResult::err(&format!("Failed to acquire file picker lock: {}", e)),
     };
 
-    let (warmup_caches, content_indexing, watch, mode) = if let Some(mut picker) = guard.take() {
-        let warmup = picker.has_mmap_cache();
-        let enable_content_indexing = picker.has_content_indexing();
-        let watch = picker.has_watcher();
-        let mode = picker.mode();
+    let (warmup_caches, content_indexing, include_binary_files, watch, mode) =
+        if let Some(mut picker) = guard.take() {
+            let warmup = picker.has_mmap_cache();
+            let enable_content_indexing = picker.has_content_indexing();
+            let include_binary_files = picker.includes_binary_files();
+            let watch = picker.has_watcher();
+            let mode = picker.mode();
 
-        picker.stop_background_monitor();
+            picker.stop_background_monitor();
 
-        (warmup, enable_content_indexing, watch, mode)
-    } else {
-        // this is error state anyway
-        (false, true, true, FFFMode::default())
-    };
+            (
+                warmup,
+                enable_content_indexing,
+                include_binary_files,
+                watch,
+                mode,
+            )
+        } else {
+            // this is error state anyway
+            (false, true, false, true, FFFMode::default())
+        };
 
     drop(guard);
 
-    match FilePicker::new_with_shared_state(
+    match FilePicker::new_with_shared_state_and_binary_files(
         inst.picker.clone(),
         inst.frecency.clone(),
         fff::FilePickerOptions {
@@ -929,6 +986,7 @@ pub unsafe extern "C" fn fff_restart_index(
             mode,
             cache_budget: None,
         },
+        include_binary_files,
     ) {
         Ok(()) => FffResult::ok_empty(),
         Err(e) => FffResult::err(&format!("Failed to init file picker: {}", e)),

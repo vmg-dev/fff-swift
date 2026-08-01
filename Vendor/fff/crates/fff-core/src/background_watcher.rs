@@ -561,6 +561,17 @@ fn handle_debounced_events(
             for path in &paths_to_remove {
                 let removed = picker.remove_file_by_path(path);
                 debug!("remove_file_by_path({:?}) -> {}", path, removed);
+                if !removed {
+                    // macOS commonly reports a renamed-away directory as
+                    // Modify(Name(Any)). Once the path is gone we cannot stat
+                    // it to recover its former type, so fall back to evicting
+                    // indexed descendants when it was not an indexed file.
+                    let count = picker.remove_all_files_in_dir(path);
+                    debug!(
+                        "remove_all_files_in_dir({:?}) fallback -> {} files",
+                        path, count
+                    );
+                }
             }
 
             let mut files_to_update = Vec::with_capacity(paths_to_add_or_modify.len());
@@ -719,17 +730,32 @@ fn track_files_from_new_directories(
     shared_frecency: &SharedFrecency,
     git_workdir: &Option<PathBuf>,
 ) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
     let mut files_to_add = Vec::new();
+    let mut directories_to_visit = vec![dir.to_path_buf()];
 
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|ft| ft.is_file()) {
+    // A rename can move an already-populated directory tree into the watched
+    // scope while producing only one directory event (not one event per
+    // descendant) on FSEvents. Walk that new subtree so folders, package
+    // bundles, and their files become visible without a full rescan.
+    while let Some(directory) = directories_to_visit.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
-            if should_include_file(&path, &repo) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let is_hidden = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with('.'));
+                if !is_hidden && !is_path_ignored(&path, &repo) {
+                    directories_to_visit.push(path);
+                }
+            } else if file_type.is_file() && should_include_file(&path, &repo) {
                 files_to_add.push(path);
             }
         }

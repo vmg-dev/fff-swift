@@ -1,0 +1,11 @@
+module CFFF {
+    header "fff.h"
+    link "fff_c"
+    link "iconv"
+    link "z"
+    link framework "CoreFoundation"
+    link framework "CoreServices"
+    link framework "Security"
+    export *
+}
+

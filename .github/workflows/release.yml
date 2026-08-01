@@ -1,0 +1,84 @@
+name: Release FFF Swift
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version without a leading v
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fff-swift-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Validate version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "$VERSION" \
+            | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Version must use the form 1.2.3." >&2
+            exit 1
+          fi
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "Tag $VERSION already exists." >&2
+            exit 1
+          fi
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test vendored FFF
+        run: make cargo-test
+
+      - name: Build and test FFFKit
+        run: make test
+
+      - name: Build release artifact
+        id: artifact
+        run: |
+          output=$(./scripts/create-release-archive.sh)
+          printf '%s\n' "$output"
+          checksum=$(printf '%s\n' "$output" | tail -n 1)
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+
+      - name: Commit the package checksum and tag
+        env:
+          VERSION: ${{ inputs.version }}
+          CHECKSUM: ${{ steps.artifact.outputs.checksum }}
+        run: |
+          ./scripts/set-release-version.sh "$VERSION" "$CHECKSUM"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Package.swift
+          git commit -m "Release FFF Swift $VERSION"
+          git tag "$VERSION"
+          git push origin HEAD:main
+          git push origin "$VERSION"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "$VERSION" \
+            Artifacts/CFFF.xcframework.zip \
+            --verify-tag \
+            --generate-notes \
+            --latest \
+            --title "FFF Swift $VERSION"
+

@@ -59,6 +59,7 @@ pub(crate) struct ScanSignals {
 pub(crate) struct ScanConfig {
     pub(crate) warmup: bool,
     pub(crate) content_indexing: bool,
+    pub(crate) include_binary_files: bool,
     pub(crate) watch: bool,
     pub(crate) auto_cache_budget: bool,
     pub(crate) install_watcher: bool,
@@ -110,6 +111,7 @@ impl ScanJob {
             config: ScanConfig {
                 warmup: picker.has_mmap_cache(),
                 content_indexing: picker.has_content_indexing(),
+                include_binary_files: picker.includes_binary_files(),
                 watch: picker.has_watcher(),
                 auto_cache_budget: !picker.has_explicit_cache_budget(),
                 install_watcher,
@@ -176,6 +178,7 @@ impl ScanJob {
             &scanned_files_counter,
             &shared_frecency,
             mode,
+            config.include_binary_files,
         ) {
             Ok(sync) => sync,
             Err(e) => {

@@ -175,6 +175,9 @@ fn resolve_dir_chunks(
     arena: ArenaPtr,
     buf: &mut [*const u8; 32],
 ) -> Option<(usize, u16)> {
+    if dir.is_deleted() {
+        return None;
+    }
     let ptrs = dir.path.resolve_ptrs(arena, buf);
     Some((ptrs.len(), dir.path.byte_len))
 }
@@ -266,10 +269,32 @@ fn match_fuzzy_parts_dirs(
 pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     dirs: &'a [DirItem],
     context: &ScoringContext,
-    arena: ArenaPtr,
+    base_count: usize,
+    base_arena: ArenaPtr,
+    overflow_arena: ArenaPtr,
 ) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
+    let results = if dirs.len() > base_count {
+        let mut results =
+            match_and_score_dirs_in_arena(&dirs[base_count..], context, overflow_arena);
+        results.extend(match_and_score_dirs_in_arena(
+            &dirs[..base_count],
+            context,
+            base_arena,
+        ));
+        results
+    } else {
+        match_and_score_dirs_in_arena(dirs, context, base_arena)
+    };
+    sort_and_paginate_dirs(results, context)
+}
+
+fn match_and_score_dirs_in_arena<'a>(
+    dirs: &'a [DirItem],
+    context: &ScoringContext,
+    arena: ArenaPtr,
+) -> Vec<(&'a DirItem, Score)> {
     if dirs.is_empty() {
-        return (vec![], vec![], 0);
+        return vec![];
     }
 
     let parsed_query = context.query;
@@ -278,7 +303,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     } else {
         match apply_constraints(dirs, &parsed_query.constraints, arena) {
             Some(filtered) if !filtered.is_empty() => filtered,
-            Some(_) => return (vec![], vec![], 0),
+            Some(_) => return vec![],
             None => dirs.iter().collect(),
         }
     };
@@ -287,7 +312,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         FuzzyQuery::Text(t) if t.len() >= 2 => std::slice::from_ref(t),
         FuzzyQuery::Parts(parts) if !parts.is_empty() => parts.as_slice(),
         _ => {
-            return score_dirs_by_frecency(&working_dirs, context);
+            return score_dirs_by_frecency(&working_dirs);
         }
     };
 
@@ -312,7 +337,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         .collect();
 
     if valid_parts.is_empty() {
-        return score_dirs_by_frecency(&working_dirs, context);
+        return score_dirs_by_frecency(&working_dirs);
     }
 
     let has_uppercase = valid_parts
@@ -409,16 +434,14 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         })
         .collect();
 
-    sort_and_paginate_dirs(results, context)
+    results
 }
 
-fn score_dirs_by_frecency<'a>(
-    dirs: &[&'a DirItem],
-    context: &ScoringContext,
-) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
-    let results: Vec<(&DirItem, Score)> = dirs
-        .iter()
-        .map(|&dir| {
+fn score_dirs_by_frecency<'a>(dirs: &[&'a DirItem]) -> Vec<(&'a DirItem, Score)> {
+    dirs.iter()
+        .copied()
+        .filter(|dir| !dir.is_deleted())
+        .map(|dir| {
             let score = Score {
                 total: dir.max_access_frecency(),
                 frecency_boost: dir.max_access_frecency(),
@@ -428,9 +451,7 @@ fn score_dirs_by_frecency<'a>(
 
             (dir, score)
         })
-        .collect();
-
-    sort_and_paginate_dirs(results, context)
+        .collect()
 }
 
 /// Sort dir results by total score (descending) and apply pagination.
