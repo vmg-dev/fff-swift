@@ -1,14 +1,15 @@
 use crate::{
-    constraints::apply_constraints,
     git::is_modified_status,
+    index::constraints::apply_constraints,
     path_utils::calculate_distance_penalty,
-    simd_path::ArenaPtr,
+    simd_path::{ArenaPtr, MAX_PATH_CHUNKS},
     sort_buffer::{sort_by_key_with_buffer, sort_with_buffer},
     types::{DirItem, FileItem, Score, ScoringContext},
 };
-use fff_query_parser::FuzzyQuery;
+use fff_query_parser::{FFFQuery, FuzzyQuery};
 use neo_frizbee::Scoring;
 use rayon::prelude::*;
+use smallvec::SmallVec;
 use std::{borrow::Cow, path::MAIN_SEPARATOR};
 
 enum FileItems<'a> {
@@ -32,7 +33,7 @@ impl<'a> FileItems<'a> {
 fn resolve_file_chunks(
     file: &FileItem,
     arena: ArenaPtr,
-    buf: &mut [*const u8; 32],
+    buf: &mut [*const u8; MAX_PATH_CHUNKS],
 ) -> Option<(usize, u16)> {
     if file.is_deleted() {
         return None;
@@ -60,15 +61,15 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    let resolve = |file: &FileItem, buf: &mut [*const u8; 32]| -> Option<(usize, u16)> {
-        resolve_file_chunks(file, arena, buf)
-    };
+    let resolve = |file: &FileItem,
+                   buf: &mut [*const u8; MAX_PATH_CHUNKS]|
+     -> Option<(usize, u16)> { resolve_file_chunks(file, arena, buf) };
 
     // because we reassemble the vec of reference we have to use a different type
     // to narrow down the [&FileItem] which would be resolved by frizbee as &&
-    let resolve_ref = |file: &&FileItem, buf: &mut [*const u8; 32]| -> Option<(usize, u16)> {
-        resolve_file_chunks(file, arena, buf)
-    };
+    let resolve_ref = |file: &&FileItem,
+                       buf: &mut [*const u8; MAX_PATH_CHUNKS]|
+     -> Option<(usize, u16)> { resolve_file_chunks(file, arena, buf) };
 
     let first_part_matches = match working_files {
         FileItems::All(files) => neo_frizbee::match_list_parallel_resolved(
@@ -168,16 +169,141 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
     sort_and_paginate(results, context)
 }
 
+pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
+    query: &'q FFFQuery<'q>,
+    items: &[&FileItem],
+    max_typos: u16,
+    base_arena: ArenaPtr,
+    overflow_arena: ArenaPtr,
+) -> Vec<SmallVec<[(u32, u32); 4]>> {
+    let parts: Vec<&str> = match &query.fuzzy_query {
+        FuzzyQuery::Text(text) if text.len() >= 2 => vec![*text],
+        FuzzyQuery::Parts(parts) => parts.iter().copied().filter(|p| p.len() >= 2).collect(),
+        _ => Vec::new(),
+    };
+
+    let mut ranges_by_item = vec![SmallVec::new(); items.len()];
+    if parts.is_empty() || items.is_empty() {
+        return ranges_by_item;
+    }
+
+    let paths: Vec<String> = items
+        .iter()
+        .map(|item| {
+            let arena = if item.is_overflow() {
+                overflow_arena
+            } else {
+                base_arena
+            };
+            let mut path = String::with_capacity(item.relative_path_len());
+            item.write_relative_path_from_arena(arena, &mut path);
+            path
+        })
+        .collect();
+
+    let has_uppercase = parts
+        .iter()
+        .any(|part| part.chars().any(|ch| ch.is_uppercase()));
+    let config = neo_frizbee::Config {
+        max_typos: Some(max_typos),
+        sort: false,
+        scoring: Scoring {
+            capitalization_bonus: if has_uppercase { 8 } else { 0 },
+            matching_case_bonus: if has_uppercase { 4 } else { 0 },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    for (idx, part) in parts.iter().copied().enumerate() {
+        let mut part_config = config;
+        if idx > 0 {
+            part_config.max_typos = config.max_typos.map(|t| t.min(part.len() as u16));
+        }
+
+        let mut matcher = neo_frizbee::Matcher::new(part, &part_config);
+        for mut matched in matcher.match_list_indices(&paths) {
+            let item_idx = matched.index as usize;
+            let Some(path) = paths.get(item_idx) else {
+                continue;
+            };
+
+            matched.indices.sort_unstable();
+            ranges_by_item[item_idx].extend(char_indices_to_byte_offsets(path, &matched.indices));
+        }
+    }
+
+    for ranges in &mut ranges_by_item {
+        *ranges = merge_byte_offsets(std::mem::take(ranges));
+    }
+
+    ranges_by_item
+}
+
+fn char_indices_to_byte_offsets(line: &str, char_indices: &[usize]) -> SmallVec<[(u32, u32); 4]> {
+    let char_byte_ranges: Vec<(usize, usize)> = line
+        .char_indices()
+        .map(|(byte_pos, ch)| (byte_pos, byte_pos + ch.len_utf8()))
+        .collect();
+    let mut result: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(char_indices.len());
+
+    for &char_idx in char_indices {
+        let Some(&(start, end)) = char_byte_ranges.get(char_idx) else {
+            continue;
+        };
+
+        if let Some(last) = result.last_mut()
+            && last.1 == start as u32
+        {
+            last.1 = end as u32;
+            continue;
+        }
+
+        result.push((start as u32, end as u32));
+    }
+
+    result
+}
+
+fn merge_byte_offsets(mut ranges: SmallVec<[(u32, u32); 4]>) -> SmallVec<[(u32, u32); 4]> {
+    if ranges.len() <= 1 {
+        return ranges;
+    }
+
+    ranges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut merged: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(ranges.len());
+
+    for (start, end) in ranges {
+        if end <= start {
+            continue;
+        }
+
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+
+        merged.push((start, end));
+    }
+
+    merged
+}
+
 /// Resolve a DirItem's chunked path into frizbee's pointer buffer.
 #[inline]
 fn resolve_dir_chunks(
     dir: &DirItem,
     arena: ArenaPtr,
-    buf: &mut [*const u8; 32],
+    overflow_arena: ArenaPtr,
+    buf: &mut [*const u8; MAX_PATH_CHUNKS],
 ) -> Option<(usize, u16)> {
-    if dir.is_deleted() {
-        return None;
-    }
+    let arena = if dir.is_overflow() {
+        overflow_arena
+    } else {
+        arena
+    };
     let ptrs = dir.path.resolve_ptrs(arena, buf);
     Some((ptrs.len(), dir.path.byte_len))
 }
@@ -190,6 +316,7 @@ fn match_fuzzy_parts_dirs(
     options: &neo_frizbee::Config,
     max_threads: usize,
     arena: ArenaPtr,
+    overflow_arena: ArenaPtr,
 ) -> Vec<neo_frizbee::Match> {
     let valid_parts: Vec<&str> = fuzzy_parts
         .iter()
@@ -202,8 +329,8 @@ fn match_fuzzy_parts_dirs(
     }
 
     let resolve_chunks_for_frizbee =
-        |dir: &&DirItem, buf: &mut [*const u8; 32]| -> Option<(usize, u16)> {
-            resolve_dir_chunks(dir, arena, buf)
+        |dir: &&DirItem, buf: &mut [*const u8; MAX_PATH_CHUNKS]| -> Option<(usize, u16)> {
+            resolve_dir_chunks(dir, arena, overflow_arena, buf)
         };
 
     let first_part_matches = neo_frizbee::match_list_parallel_resolved(
@@ -269,42 +396,24 @@ fn match_fuzzy_parts_dirs(
 pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     dirs: &'a [DirItem],
     context: &ScoringContext,
-    base_count: usize,
-    base_arena: ArenaPtr,
+    arena: ArenaPtr,
     overflow_arena: ArenaPtr,
 ) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
-    let results = if dirs.len() > base_count {
-        let mut results =
-            match_and_score_dirs_in_arena(&dirs[base_count..], context, overflow_arena);
-        results.extend(match_and_score_dirs_in_arena(
-            &dirs[..base_count],
-            context,
-            base_arena,
-        ));
-        results
-    } else {
-        match_and_score_dirs_in_arena(dirs, context, base_arena)
-    };
-    sort_and_paginate_dirs(results, context)
-}
-
-fn match_and_score_dirs_in_arena<'a>(
-    dirs: &'a [DirItem],
-    context: &ScoringContext,
-    arena: ArenaPtr,
-) -> Vec<(&'a DirItem, Score)> {
     if dirs.is_empty() {
-        return vec![];
+        return (vec![], vec![], 0);
     }
 
     let parsed_query = context.query;
+    // Ghost dirs (all files tombstoned) never surface in search results.
     let working_dirs: Vec<&DirItem> = if parsed_query.constraints.is_empty() {
-        dirs.iter().collect()
+        dirs.iter().filter(|d| !d.is_deleted()).collect()
     } else {
-        match apply_constraints(dirs, &parsed_query.constraints, arena) {
-            Some(filtered) if !filtered.is_empty() => filtered,
-            Some(_) => return vec![],
-            None => dirs.iter().collect(),
+        match apply_constraints(dirs, &parsed_query.constraints, arena, overflow_arena) {
+            Some(filtered) if !filtered.is_empty() => {
+                filtered.into_iter().filter(|d| !d.is_deleted()).collect()
+            }
+            Some(_) => return (vec![], vec![], 0),
+            None => dirs.iter().filter(|d| !d.is_deleted()).collect(),
         }
     };
 
@@ -312,23 +421,9 @@ fn match_and_score_dirs_in_arena<'a>(
         FuzzyQuery::Text(t) if t.len() >= 2 => std::slice::from_ref(t),
         FuzzyQuery::Parts(parts) if !parts.is_empty() => parts.as_slice(),
         _ => {
-            return score_dirs_by_frecency(&working_dirs);
+            return score_dirs_by_frecency(&working_dirs, context);
         }
     };
-
-    // See `score_files` — stored dir paths are platform-native on Windows.
-    #[cfg(windows)]
-    let fuzzy_parts_owned: Option<Vec<String>> = if fuzzy_parts.iter().any(|p| p.contains('/')) {
-        Some(fuzzy_parts.iter().map(|p| p.replace('/', "\\")).collect())
-    } else {
-        None
-    };
-    #[cfg(windows)]
-    let fuzzy_parts_refs: Option<Vec<&str>> = fuzzy_parts_owned
-        .as_ref()
-        .map(|v| v.iter().map(String::as_str).collect());
-    #[cfg(windows)]
-    let fuzzy_parts: &[&str] = fuzzy_parts_refs.as_deref().unwrap_or(fuzzy_parts);
 
     let valid_parts: Vec<&str> = fuzzy_parts
         .iter()
@@ -337,7 +432,7 @@ fn match_and_score_dirs_in_arena<'a>(
         .collect();
 
     if valid_parts.is_empty() {
-        return score_dirs_by_frecency(&working_dirs);
+        return score_dirs_by_frecency(&working_dirs, context);
     }
 
     let has_uppercase = valid_parts
@@ -352,6 +447,7 @@ fn match_and_score_dirs_in_arena<'a>(
             matching_case_bonus: if has_uppercase { 4 } else { 0 },
             ..Default::default()
         },
+        ..Default::default()
     };
 
     let path_matches = match_fuzzy_parts_dirs(
@@ -360,6 +456,7 @@ fn match_and_score_dirs_in_arena<'a>(
         &options,
         context.max_threads,
         arena,
+        overflow_arena,
     );
 
     let main_needle = valid_parts[0].as_bytes();
@@ -372,12 +469,17 @@ fn match_and_score_dirs_in_arena<'a>(
         .into_iter()
         .map(|path_match| {
             let dir = working_dirs[path_match.index as usize];
+            let dir_arena = if dir.is_overflow() {
+                overflow_arena
+            } else {
+                arena
+            };
             let base_score = path_match.score as i32;
             let frecency_boost = base_score.saturating_mul(dir.max_access_frecency()) / 100;
 
             // Distance penalty from current file's directory.
             let distance_penalty = if context.current_file.is_some() {
-                dir.path.write_to_string(arena, &mut dir_buf);
+                dir.path.write_to_string(dir_arena, &mut dir_buf);
                 calculate_distance_penalty(context.current_file, &dir_buf)
             } else {
                 0
@@ -388,7 +490,7 @@ fn match_and_score_dirs_in_arena<'a>(
             let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
             let is_dirname_match = match_start_approx >= last_seg_offset;
 
-            dir.write_dir_name(arena, &mut dirname_buf);
+            dir.write_dir_name(dir_arena, &mut dirname_buf);
             let dirname_len = dirname_buf.len();
             let is_exact_dirname = is_dirname_match
                 && main_needle_len as usize == dirname_len
@@ -434,14 +536,16 @@ fn match_and_score_dirs_in_arena<'a>(
         })
         .collect();
 
-    results
+    sort_and_paginate_dirs(results, context)
 }
 
-fn score_dirs_by_frecency<'a>(dirs: &[&'a DirItem]) -> Vec<(&'a DirItem, Score)> {
-    dirs.iter()
-        .copied()
-        .filter(|dir| !dir.is_deleted())
-        .map(|dir| {
+fn score_dirs_by_frecency<'a>(
+    dirs: &[&'a DirItem],
+    context: &ScoringContext,
+) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
+    let results: Vec<(&DirItem, Score)> = dirs
+        .iter()
+        .map(|&dir| {
             let score = Score {
                 total: dir.max_access_frecency(),
                 frecency_boost: dir.max_access_frecency(),
@@ -451,7 +555,9 @@ fn score_dirs_by_frecency<'a>(dirs: &[&'a DirItem]) -> Vec<(&'a DirItem, Score)>
 
             (dir, score)
         })
-        .collect()
+        .collect();
+
+    sort_and_paginate_dirs(results, context)
 }
 
 /// Sort dir results by total score (descending) and apply pagination.
@@ -509,7 +615,7 @@ fn match_and_score_in_arena<'a>(
     let working_files: FileItems<'a> = if parsed.constraints.is_empty() {
         FileItems::All(files)
     } else {
-        match apply_constraints(files, &parsed.constraints, arena) {
+        match apply_constraints(files, &parsed.constraints, arena, arena) {
             Some(filtered) if !filtered.is_empty() => FileItems::Filtered(filtered),
             Some(_) => {
                 return vec![];
@@ -525,22 +631,6 @@ fn match_and_score_in_arena<'a>(
             return score_filtered_by_frecency(&working_files, context, arena);
         }
     };
-
-    // On Windows, stored relative paths use the native `\\` separator while
-    // users type `/`. Translate so frizbee sees the same bytes it would on
-    // a path stored by the walker.
-    #[cfg(windows)]
-    let fuzzy_parts_owned: Option<Vec<String>> = if fuzzy_parts.iter().any(|p| p.contains('/')) {
-        Some(fuzzy_parts.iter().map(|p| p.replace('/', "\\")).collect())
-    } else {
-        None
-    };
-    #[cfg(windows)]
-    let fuzzy_parts_refs: Option<Vec<&str>> = fuzzy_parts_owned
-        .as_ref()
-        .map(|v| v.iter().map(String::as_str).collect());
-    #[cfg(windows)]
-    let fuzzy_parts: &[&str] = fuzzy_parts_refs.as_deref().unwrap_or(fuzzy_parts);
 
     debug_assert!(!fuzzy_parts.is_empty());
     let has_uppercase = fuzzy_parts
@@ -560,6 +650,7 @@ fn match_and_score_in_arena<'a>(
             matching_case_bonus: if has_uppercase { 4 } else { 0 },
             ..Default::default()
         },
+        ..Default::default()
     };
 
     let path_matches = match_fuzzy_parts(
@@ -862,13 +953,17 @@ fn score_filtered_by_frecency<'a>(
     match files {
         FileItems::All(s) => s
             .par_iter()
-            .filter(|f| !f.is_deleted())
-            .map(&score_file)
+            .filter_map(|f| {
+                let live = !f.is_deleted();
+                live.then_some(score_file(f))
+            })
             .collect(),
         FileItems::Filtered(v) => v
             .iter()
-            .filter(|f| !f.is_deleted())
-            .map(|&file| score_file(file))
+            .filter_map(|f| {
+                let live = !f.is_deleted();
+                live.then_some(score_file(f))
+            })
             .collect(),
     }
 }
@@ -1359,6 +1454,31 @@ mod filename_bonus_tests {
             "near-exact full-path match should rank first, but got: {} \
              (total={}, base={}, frecency={})",
             results[0].0, results[0].1.total, results[0].1.base_score, results[0].1.frecency_boost,
+        );
+    }
+
+    /// Regression: PR #652 / field panic in pi-fff v0.9.6.
+    /// A path >512 bytes (but within PATH_MAX) overflows the fixed
+    /// `[*const u8; 32]` chunk-pointer buffer during scoring and panics with
+    /// "index out of bounds: the len is 32 but the index is 32".
+    #[test]
+    fn test_path_longer_than_512_bytes_does_not_panic_and_matches() {
+        let mut long_path = String::new();
+        while long_path.len() < 600 {
+            long_path.push_str("deeply_nested_directory_segment/");
+        }
+        long_path.push_str("needle_file.rs");
+        assert!(long_path.len() > 512 && long_path.len() < crate::simd_path::PATH_BUF_SIZE);
+
+        let (files, arena) = make_files(&[long_path.as_str(), "src/other.rs"]);
+
+        // Panics here on unfixed code: frizbee resolves chunk ptrs per file.
+        let results = search(&files, "needle", arena);
+
+        assert!(
+            results.iter().any(|(p, _)| p == &long_path),
+            "filename at the tail of a >512-byte path must still match, got: {:?}",
+            results.iter().map(|(p, _)| p).collect::<Vec<_>>()
         );
     }
 

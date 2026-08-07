@@ -8,6 +8,8 @@
  * All methods return Result types for explicit error handling.
  */
 
+import { FFIType, JSCallback, type Pointer } from "bun:ffi";
+
 import {
   ensureLoaded,
   ffiCreate,
@@ -15,6 +17,7 @@ import {
   ffiGetBasePath,
   ffiGetHistoricalQuery,
   ffiGetScanProgress,
+  ffiGlob,
   ffiHealthCheck,
   ffiIsScanning,
   ffiLiveGrep,
@@ -25,29 +28,37 @@ import {
   ffiSearch,
   ffiSearchDirectories,
   ffiSearchMixed,
+  ffiSetWatchCallback,
   ffiTrackQuery,
+  ffiUnwatch,
   ffiWaitForScan,
-  ffiWaitForWatcher,
+  ffiWatch,
   isAvailable,
   type NativeHandle,
+  readWatchEventBatch,
 } from "./ffi";
 
 import type {
   DirSearchOptions,
   DirSearchResult,
+  InitOptions as FFFInitOptions,
+  FileFinderApi,
+  GlobOptions,
   GrepOptions,
   GrepResult,
   HealthCheck,
-  InitOptions as FFFInitOptions,
   MixedSearchResult,
   MultiGrepOptions,
   Result,
   ScanProgress,
   SearchOptions,
   SearchResult,
-} from "./types";
+  WatchBatchCallback,
+  WatchOptions,
+  WatchUnsubscribe,
+} from "./fff-api";
 
-import { err } from "./types";
+import { err } from "./fff-api";
 
 /**
  * FileFinder - Fast file finder with fuzzy search
@@ -67,7 +78,7 @@ import { err } from "./types";
  * }
  *
  * // Wait for initial scan
- * finder.value.waitForScan(5000);
+ * await finder.value.waitForScan(5000);
  *
  * // Search for files
  * const search = finder.value.search("main.ts");
@@ -81,8 +92,16 @@ import { err } from "./types";
  * finder.value.destroy();
  * ```
  */
-export class FileFinder {
+export class FileFinder implements FileFinderApi {
   private handle: NativeHandle | null;
+  /** Active watch subscriptions: native watch id -> JS batch handler. */
+  private watchHandlers = new Map<number, WatchBatchCallback>();
+  /**
+   * ONE threadsafe JSCallback per instance, registered lazily with
+   * `fff_set_watch_callback` on the first subscription and closed in
+   * `destroy()` after `fff_destroy` returns (the quiescence barrier).
+   */
+  private watchJsCallback: JSCallback | null = null;
 
   private constructor(handle: NativeHandle) {
     this.handle = handle;
@@ -122,6 +141,8 @@ export class FileFinder {
       BigInt(options.cacheBudgetMaxFiles ?? 0),
       BigInt(options.cacheBudgetMaxBytes ?? 0),
       BigInt(options.cacheBudgetMaxFileSize ?? 0),
+      options.enableFsRootScanning ?? false,
+      options.enableHomeDirScanning ?? false,
     );
 
     if (!result.ok) {
@@ -134,14 +155,19 @@ export class FileFinder {
   /**
    * Destroy and clean up all resources.
    *
-   * Call this when you're done using the file finder to free memory
-   * and stop background file watching. After calling this, the instance
-   * must not be used again.
+   * Frees the native instance (unsubscribing all watches), then closes the
+   * instance watch trampoline. After calling this, the instance must not be
+   * used again.
    */
   destroy(): void {
     if (this.handle !== null) {
+      this.watchHandlers.clear();
       ffiDestroy(this.handle);
       this.handle = null;
+      // Handlers were cleared first, so a delivery racing the destroy is a
+      // benign id-map miss before the trampoline is closed.
+      this.watchJsCallback?.close();
+      this.watchJsCallback = null;
     }
   }
 
@@ -199,6 +225,30 @@ export class FileFinder {
       options?.pageSize ?? 0,
       options?.comboBoostMultiplier ?? 0,
       options?.minComboCount ?? 0,
+    );
+  }
+
+  /**
+   * Glob-only search.
+   *
+   * The pattern is applied as a single pass SIMD optimized prefiltering
+   * without any fuzzy matching involved. Faster and 100% compatible to npm `glob`.
+   *
+   * @param pattern - Glob pattern (required, non-empty)
+   * @param options - Glob search options (pagination, max threads, current file)
+   * @returns Search results with files matching the glob
+   */
+  glob(pattern: string, options?: GlobOptions): Result<SearchResult> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+
+    return ffiGlob(
+      guard.value,
+      pattern,
+      options?.currentFile ?? "",
+      options?.maxThreads ?? 0,
+      options?.pageIndex ?? 0,
+      options?.pageSize ?? 0,
     );
   }
 
@@ -321,11 +371,11 @@ export class FileFinder {
       options?.maxMatchesPerFile ?? 0,
       options?.smartCase ?? true,
       options?.cursor?._offset ?? 0,
-      0, // page_limit (0 = default 50)
+      options?.pageSize ?? 0,
       options?.timeBudgetMs ?? 0,
       options?.beforeContext ?? 0,
       options?.afterContext ?? 0,
-      false,
+      options?.classifyDefinitions ?? false,
     );
   }
 
@@ -370,11 +420,11 @@ export class FileFinder {
       options.maxMatchesPerFile ?? 0,
       options.smartCase ?? true,
       options.cursor?._offset ?? 0,
-      0, // page_limit (0 = default 50)
+      options.pageSize ?? 0,
       options.timeBudgetMs ?? 0,
       options.beforeContext ?? 0,
       options.afterContext ?? 0,
-      false,
+      options.classifyDefinitions ?? false,
     );
   }
 
@@ -419,6 +469,9 @@ export class FileFinder {
   /**
    * Wait for the initial file scan to complete.
    *
+   * Non-blocking: polls `isScanning` and yields to the event loop between
+   * checks, so other async work keeps running while waiting.
+   *
    * @param timeoutMs - Maximum time to wait in milliseconds (default: 5000)
    * @returns true if scan completed, false if timed out
    *
@@ -426,33 +479,67 @@ export class FileFinder {
    * ```typescript
    * const finder = FileFinder.create({ basePath: "/path/to/project" });
    * if (finder.ok) {
-   *   const completed = finder.value.waitForScan(10000);
+   *   const completed = await finder.value.waitForScan(10000);
    *   if (!completed.ok || !completed.value) {
    *     console.warn("Scan did not complete in time");
    *   }
    * }
    * ```
    */
-  waitForScan(timeoutMs: number = 5000): Result<boolean> {
+  async waitForScan(timeoutMs: number = 5000): Promise<Result<boolean>> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+
+    const deadline = Date.now() + timeoutMs;
+    while (this.isScanning()) {
+      if (Date.now() >= deadline) {
+        return { ok: true, value: false };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return { ok: true, value: true };
+  }
+
+  /**
+   * Wait for the initial file scan to complete, blocking the calling thread.
+   *
+   * Backed by the native `fff_wait_for_scan` call. Prefer {@link waitForScan}
+   * unless you specifically need synchronous blocking behaviour.
+   *
+   * @param timeoutMs - Maximum time to wait in milliseconds (default: 5000)
+   * @returns true if scan completed, false if timed out
+   */
+  waitForScanBlocking(timeoutMs: number = 5000): Result<boolean> {
     const guard = this.ensureAlive();
     if (!guard.ok) return guard;
     return ffiWaitForScan(guard.value, timeoutMs);
   }
 
   /**
-   * Wait for the background file watcher to be ready.
+   * Wait until the index is fully ready: the scan has finished and the warmup
+   * (content indexing / bigram) phase has completed.
    *
-   * The watcher is created after the initial scan, git status, and optional
-   * warmup phases complete. Useful for tests that need to ensure filesystem
-   * events will be detected.
+   * Non-blocking — polls `getScanProgress` and yields to the event loop.
    *
-   * @param timeoutMs - Maximum time to wait in milliseconds (default: 10000)
-   * @returns true if watcher is ready, false if timed out
+   * @param timeoutMs - Maximum time to wait in milliseconds (default: 5000)
+   * @returns true if the index became ready, false if timed out
    */
-  waitForWatcher(timeoutMs: number = 10000): Result<boolean> {
+  async waitForIndexReady(timeoutMs: number = 5000): Promise<Result<boolean>> {
     const guard = this.ensureAlive();
     if (!guard.ok) return guard;
-    return ffiWaitForWatcher(guard.value, timeoutMs);
+
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const progress = this.getScanProgress();
+      if (!progress.ok) return progress;
+      if (!progress.value.isScanning && progress.value.isWarmupComplete) {
+        return { ok: true, value: true };
+      }
+      if (Date.now() >= deadline) {
+        return { ok: true, value: false };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
   }
 
   /**
@@ -504,6 +591,119 @@ export class FileFinder {
     const guard = this.ensureAlive();
     if (!guard.ok) return guard;
     return ffiGetHistoricalQuery(guard.value, offset);
+  }
+
+  /**
+   * Lazily create + register the instance-wide watch trampoline. Routes
+   * every delivered batch to the handler registered for its watch id;
+   * unknown ids (unsubscribe races) are benign — the batch is just freed.
+   */
+  private ensureWatchTrampoline(handle: NativeHandle): Result<void> {
+    if (this.watchJsCallback !== null) return { ok: true, value: undefined };
+
+    // Threadsafe: the native callback thread enqueues the invocation onto the
+    // JS event loop; the batch stays valid because JS owns it until it frees
+    // it inside readWatchEventBatch.
+    const jsCallback = new JSCallback(
+      (watchId: bigint | number, batchPtr: Pointer, _userData: Pointer) => {
+        const events = readWatchEventBatch(batchPtr);
+        const handler = this.watchHandlers.get(Number(watchId));
+        if (handler !== undefined && events.length > 0) {
+          handler(events);
+        }
+      },
+      {
+        // an attempt to fix the bug that is kept unfixed in the zig version of bun :()
+        // https://github.com/oven-sh/bun/issues/33840:
+        //
+        // watch_id is declared `ptr`, not `u64`: ABI-identical (one 64-bit
+        // register), but u64 args make bun allocate a JSBigInt on the CALLING
+        // (non-JS) thread, corrupting the JS heap
+        args: [FFIType.ptr, FFIType.ptr, FFIType.ptr],
+        returns: FFIType.void,
+        threadsafe: true,
+      },
+    );
+
+    const registered = ffiSetWatchCallback(handle, jsCallback);
+    if (!registered.ok) {
+      jsCallback.close();
+      return registered;
+    }
+    this.watchJsCallback = jsCallback;
+    return { ok: true, value: undefined };
+  }
+
+  /**
+   * Subscribe to filesystem changes matching `pattern` (glob, exact file,
+   * or directory subtree). Omit the pattern to watch the entire indexed
+   * tree. Normalized batches of up to 128 events are delivered on the JS event
+   * loop, with each path appearing at most once. See `FileFinderApi.watch`.
+   *
+   * @example
+   * ```typescript
+   * const sub = finder.watch("**\/*.ts", (events) => {
+   *   for (const e of events) console.log(e.kind, e.path);
+   * });
+   * if (sub.ok) sub.value(); // unsubscribe
+   *
+   * // no pattern: everything under the indexed base path
+   * const all = finder.watch((events) => console.log(events.length));
+   * ```
+   */
+  watch(callback: WatchBatchCallback, options?: WatchOptions): Result<WatchUnsubscribe>;
+  watch(
+    pattern: string,
+    callback: WatchBatchCallback,
+    options?: WatchOptions,
+  ): Result<WatchUnsubscribe>;
+  watch(
+    patternOrCallback: string | WatchBatchCallback,
+    callbackOrOptions?: WatchBatchCallback | WatchOptions,
+    maybeOptions?: WatchOptions,
+  ): Result<WatchUnsubscribe> {
+    // Overload shift: watch(cb, opts?) -> empty pattern = whole tree.
+    const noPattern = typeof patternOrCallback === "function";
+    const pattern = noPattern ? "" : patternOrCallback;
+    const callback = noPattern
+      ? patternOrCallback
+      : (callbackOrOptions as WatchBatchCallback);
+    const options = noPattern
+      ? (callbackOrOptions as WatchOptions | undefined)
+      : maybeOptions;
+
+    if (typeof callback !== "function") {
+      return err("watch callback must be a function");
+    }
+
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+
+    const trampoline = this.ensureWatchTrampoline(guard.value);
+    if (!trampoline.ok) return trampoline;
+
+    const result = ffiWatch(guard.value, pattern, options?.ignore ?? []);
+    if (!result.ok) return result;
+
+    // No startup race: the threadsafe trampoline only runs on the JS event
+    // loop, so this synchronous set always precedes the first routing lookup.
+    const watchId = result.value;
+    this.watchHandlers.set(watchId, callback);
+
+    return { ok: true, value: () => this.unwatchById(watchId) };
+  }
+
+  /**
+   * Remove a subscription from the routing map, then from the native side.
+   * Map removal is synchronous on the JS thread, so once this returns the
+   * handler can never run again (late native batches miss the lookup).
+   * Idempotent.
+   */
+  private unwatchById(watchId: number): void {
+    if (!this.watchHandlers.delete(watchId)) return;
+    if (this.handle !== null) {
+      ffiUnwatch(this.handle, watchId);
+    }
   }
 
   /**

@@ -46,6 +46,7 @@
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         cargoToml = builtins.fromTOML (builtins.readFile ./crates/fff-nvim/Cargo.toml);
+        fffMcpCargoToml = builtins.fromTOML (builtins.readFile ./crates/fff-mcp/Cargo.toml);
 
         # Common arguments can be set here to avoid repeating them later
         # Note: changes here will rebuild all dependency crates
@@ -61,6 +62,10 @@
             openssl
           ];
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+
+          # in zlob we compile by default with -target=native unless CI is detected, because 
+          # nix is different we have to make sure that the build target is a baseline cpu
+          CI = "1";
 
           # Zig 0.16 insists on writing to its global cache even when the
           # zlob build.rs passes --global-cache-dir. In the nix sandbox $HOME
@@ -81,6 +86,21 @@
             doCheck = false;
           }
         );
+
+        fff-mcp-args = commonArgs // {
+          pname = fffMcpCargoToml.package.name;
+          version = fffMcpCargoToml.package.version;
+          cargoExtraArgs = "-p fff-mcp --bin fff-mcp";
+        };
+
+        fff-mcp = craneLib.buildPackage (
+          fff-mcp-args
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly fff-mcp-args;
+            doCheck = false;
+          }
+        );
+
         # Copies the dynamic library into the target/release folder
         copy-dynamic-library = /* bash */ ''
           set -eo pipefail
@@ -95,11 +115,12 @@
       in
       {
         checks = {
-          inherit my-crate;
+          inherit my-crate fff-mcp;
         };
 
         packages = {
           default = my-crate;
+          inherit fff-mcp;
 
           # Neovim plugin
           fff-nvim = pkgs.vimUtils.buildVimPlugin {
@@ -113,6 +134,10 @@
 
         apps.default = flake-utils.lib.mkApp {
           drv = my-crate;
+        };
+
+        apps.fff-mcp = flake-utils.lib.mkApp {
+          drv = fff-mcp;
         };
 
         # Add the release command

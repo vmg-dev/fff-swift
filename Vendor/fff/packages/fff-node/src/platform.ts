@@ -14,6 +14,8 @@ export function getTriple(): string {
   let osName: string;
   if (platform === "darwin") {
     osName = "apple-darwin";
+  } else if (platform === "android") {
+    osName = "linux-android";
   } else if (platform === "linux") {
     osName = detectLinuxLibc();
   } else if (platform === "win32") {
@@ -30,16 +32,20 @@ export function getTriple(): string {
  * Detect whether we're on musl or glibc Linux
  */
 function detectLinuxLibc(): string {
+  let output = "";
   try {
-    const lddOutput = execSync("ldd --version 2>&1", {
+    output = execSync("ldd --version 2>&1", {
       encoding: "utf-8",
       timeout: 5000,
     });
-    if (lddOutput.toLowerCase().includes("musl")) {
-      return "unknown-linux-musl";
-    }
-  } catch {
-    // ldd failed, assume glibc
+  } catch (e: unknown) {
+    const err = e as { stdout?: string | Buffer; stderr?: string | Buffer };
+    output = String(err?.stdout ?? "") + String(err?.stderr ?? "");
+  }
+
+  // ldd on musl can produce stdout with musl either with exit code 1 or 0
+  if (output.toLowerCase().includes("musl")) {
+    return "unknown-linux-musl";
   }
   return "unknown-linux-gnu";
 }
@@ -105,6 +111,7 @@ const TRIPLE_TO_NPM_PACKAGE: Record<string, string> = {
   "aarch64-unknown-linux-musl": "@ff-labs/fff-bin-linux-arm64-musl",
   "x86_64-pc-windows-msvc": "@ff-labs/fff-bin-win32-x64",
   "aarch64-pc-windows-msvc": "@ff-labs/fff-bin-win32-arm64",
+  "aarch64-linux-android": "@ff-labs/fff-bin-android-arm64",
 };
 
 /**

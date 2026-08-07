@@ -79,22 +79,25 @@ public final class FFFIndex: @unchecked Sendable {
                     self.rootURL.path.withCString { root in
                         frecencyPath.withCString { frecency in
                             historyPath.withCString { history in
-                                fff_create_instance3(
-                                    root,
-                                    frecency,
-                                    history,
-                                    false,
-                                    true,
-                                    self.enableContentIndexing,
-                                    self.watch,
-                                    false,
-                                    self.includeBinaryFiles,
-                                    logFile,
-                                    logFile == nil ? nil : logLevel,
-                                    0,
-                                    0,
-                                    0
-                                )
+                                var options = FffCreateOptions()
+                                options.version = UInt32(FFF_CREATE_OPTIONS_VERSION)
+                                options.base_path = root
+                                options.frecency_db_path = frecency
+                                options.history_db_path = history
+                                options.enable_mmap_cache = true
+                                options.enable_content_indexing = self.enableContentIndexing
+                                options.watch = self.watch
+                                options.ai_mode = false
+                                options.log_file_path = logFile
+                                options.log_level = logFile == nil ? nil : logLevel
+                                options.cache_budget_max_files = 0
+                                options.cache_budget_max_bytes = 0
+                                options.cache_budget_max_file_size = 0
+                                options.enable_fs_root_scanning = false
+                                options.enable_home_dir_scanning = false
+                                options.follow_symlinks = false
+                                options.include_binary_files = self.includeBinaryFiles
+                                return fff_create_instance_with(&options)
                             }
                         }
                     }

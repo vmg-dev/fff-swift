@@ -26,26 +26,63 @@ pub enum Error {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
-    #[error("Failed to open frecency database env: {0}")]
-    EnvOpen(#[source] heed::Error),
-    #[error("Failed to create frecency database: {0}")]
-    DbCreate(#[source] heed::Error),
-    #[error("Failed to open frecency database: {0}")]
-    DbOpen(#[source] heed::Error),
-    #[error("Failed to clear stale readers for frecency database: {0}")]
-    DbClearStaleReaders(#[source] heed::Error),
+    #[error("Something is wrong with the local db instance: {0}")]
+    GenericDbError(#[from] heed::Error),
+    #[error("Failed to open {db} database env: {source}")]
+    EnvOpen {
+        db: &'static str,
+        #[source]
+        source: heed::Error,
+    },
+    #[error("Failed to create {db} database: {source}")]
+    DbCreate {
+        db: &'static str,
+        #[source]
+        source: heed::Error,
+    },
+    #[error("Failed to open {db} database: {source}")]
+    DbOpen {
+        db: &'static str,
+        #[source]
+        source: heed::Error,
+    },
+    #[error("Failed to clear stale readers for {db} database: {source}")]
+    DbClearStaleReaders {
+        db: &'static str,
+        #[source]
+        source: heed::Error,
+    },
 
-    #[error("Failed to start read transaction for frecency database: {0}")]
-    DbStartReadTxn(#[source] heed::Error),
-    #[error("Failed to start write transaction for frecency database: {0}")]
-    DbStartWriteTxn(#[source] heed::Error),
-
-    #[error("Failed to read from frecency database: {0}")]
-    DbRead(#[source] heed::Error),
-    #[error("Failed to write to frecency database: {0}")]
-    DbWrite(#[source] heed::Error),
-    #[error("Failed to commit write transaction to frecency database: {0}")]
-    DbCommit(#[source] heed::Error),
+    #[error("Failed to start read transaction for {db} database: {source}")]
+    DbStartReadTxn {
+        db: &'static str,
+        #[source]
+        source: heed::Error,
+    },
+    #[error("Failed to start write transaction for {db} database: {source}")]
+    DbStartWriteTxn {
+        db: &'static str,
+        #[source]
+        source: heed::Error,
+    },
+    #[error("Failed to read from {db} database: {source}")]
+    DbRead {
+        db: &'static str,
+        #[source]
+        source: heed::Error,
+    },
+    #[error("Failed to write to {db} database: {source}")]
+    DbWrite {
+        db: &'static str,
+        #[source]
+        source: heed::Error,
+    },
+    #[error("Failed to commit write transaction to {db} database: {source}")]
+    DbCommit {
+        db: &'static str,
+        #[source]
+        source: heed::Error,
+    },
     #[error("Failed to start file system watcher: {0}")]
     FileSystemWatch(#[from] notify::Error),
 
@@ -54,6 +91,24 @@ pub enum Error {
 
     #[error("libgit2 error occurred: {0}")]
     Git(#[from] git2::Error),
+
+    #[error("Filesystem walk failed: {0}")]
+    WalkFailed(String),
+
+    #[error("Invalid glob pattern '{pattern}': {reason}")]
+    InvalidGlobPattern { pattern: String, reason: String },
+
+    #[error("File system watching is disabled for this picker")]
+    WatcherDisabled,
+
+    #[error("File system watcher is not ready")]
+    WatcherNotReady,
+
+    #[error("Indexed base path changed while creating the watch subscription")]
+    WatchBaseChanged,
+
+    #[error("Failed to start watch callback dispatcher: {0}")]
+    WatchDispatcherStart(#[source] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
