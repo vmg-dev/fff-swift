@@ -5,13 +5,26 @@ use std::{
     fmt::Debug,
     path::{Path, PathBuf},
 };
-use tracing::debug;
 
 pub(crate) fn default_status_options() -> StatusOptions {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .include_unmodified(true)
+        .exclude_submodules(true);
+    opts
+}
+
+/// Status options for the initial scan / rescan.
+///
+/// Skips `include_unmodified` because every `FileItem` starts with
+/// `git_status: None` (== clean), so a missing cache entry already means
+/// "clean" — no need to ask libgit2 to enumerate every tracked path.
+/// Saves seconds on huge dirty trees (e.g. chromium with 400k+ entries).
+pub(crate) fn initial_scan_status_options() -> StatusOptions {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
         .exclude_submodules(true);
     opts
 }
@@ -49,7 +62,7 @@ impl GitStatusCache {
 
         let mut entries = AHashMap::with_capacity(statuses.len());
         for entry in &statuses {
-            if let Some(entry_path) = entry.path() {
+            if let Ok(entry_path) = entry.path() {
                 // libgit2 returns entry paths with forward slashes on every platform
                 // fff stores native paths - meaning we have forward slash issue on windows
                 let full_path = crate::path_utils::normalize(repo_path.join(entry_path));
@@ -79,7 +92,7 @@ impl GitStatusCache {
         }
     }
 
-    #[tracing::instrument(skip(repo), level = tracing::Level::DEBUG)]
+    #[tracing::instrument(skip(repo), fields(paths_count = paths.len()), level = tracing::Level::DEBUG)]
     pub fn git_status_for_paths<TPath: AsRef<Path> + Debug>(
         repo: &Repository,
         paths: &[TPath],
@@ -111,11 +124,6 @@ impl GitStatusCache {
         }
 
         let git_status_cache = Self::read_status_impl(repo, &mut status_options)?;
-        debug!(
-            status_len = git_status_cache.statuses_len(),
-            "Multiple files git status"
-        );
-
         Ok(git_status_cache)
     }
 }

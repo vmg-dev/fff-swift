@@ -1,14 +1,3 @@
-//! Randomized file-system mutation stress test.
-//!
-//! Seeds a directory with ~40 files across diverse content domains, builds the
-//! picker + bigram index, then runs 20 rounds of randomized create / edit /
-//! delete / rename / read-only operations. After every round the test verifies
-//! that plain-text grep, regex grep, and fuzzy file search all return correct
-//! results for every live and dead file.
-//!
-//! Uses a seeded RNG (`SmallRng::seed_from_u64`) for deterministic
-//! reproduction.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -379,7 +368,7 @@ fn fuzz_file_operations_stress() {
                 let mut guard = shared_picker.write().unwrap();
                 let picker = guard.as_mut().unwrap();
                 assert!(
-                    picker.on_create_or_modify(base.join(name)).is_some(),
+                    picker.handle_create_or_modify(base.join(name)).is_some(),
                     "round {round}: on_create_or_modify({name}) should succeed for edit"
                 );
             }
@@ -399,7 +388,7 @@ fn fuzz_file_operations_stress() {
                 let mut guard = shared_picker.write().unwrap();
                 let picker = guard.as_mut().unwrap();
                 assert!(
-                    picker.on_create_or_modify(base.join(&name)).is_some(),
+                    picker.handle_create_or_modify(base.join(&name)).is_some(),
                     "round {round}: on_create_or_modify({name}) should succeed for create"
                 );
             }
@@ -453,7 +442,9 @@ fn fuzz_file_operations_stress() {
                 let mut guard = shared_picker.write().unwrap();
                 let picker = guard.as_mut().unwrap();
                 assert!(
-                    picker.on_create_or_modify(base.join(&new_name)).is_some(),
+                    picker
+                        .handle_create_or_modify(base.join(&new_name))
+                        .is_some(),
                     "round {round}: on_create_or_modify({new_name}) should succeed for rename"
                 );
             }
@@ -765,4 +756,99 @@ fn git_init_and_commit(dir: &Path) {
     git_run(dir, &["init"]);
     git_run(dir, &["add", "-A"]);
     git_run(dir, &["commit", "-m", "initial"]);
+}
+
+/// Proves that dropping the picker while post-scan (warmup + bigram build)
+/// is actively iterating raw pointers does NOT segfault. The Drop impl
+/// sets `cancelled`, waits for `post_scan_indexing_active` to clear, and
+/// only then frees the backing Vec.
+///
+/// Runs 10 iterations to exercise the race window reliably.
+#[test]
+fn drop_during_post_scan_does_not_crash() {
+    let mut caught_active = 0u32;
+
+    for round in 0..10 {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Create enough files so bigram build takes measurable time
+        for i in 0..2000 {
+            let dir = base.join(format!("d_{:02}", i % 20));
+            fs::create_dir_all(&dir).unwrap();
+            let content = format!(
+                "fn func_{i}() {{ let x = {i}; println!(\"{{x}}\"); }}\n\
+                 const T_{i}: &str = \"TOKEN_{i}\";\n"
+            );
+            fs::write(dir.join(format!("f_{i:04}.rs")), content).unwrap();
+        }
+
+        git_init_and_commit(base);
+
+        let shared_picker = SharedFilePicker::default();
+
+        FilePicker::new_with_shared_state(
+            shared_picker.clone(),
+            SharedFrecency::noop(),
+            FilePickerOptions {
+                base_path: base.to_string_lossy().to_string(),
+                enable_mmap_cache: true,
+                enable_content_indexing: true,
+                watch: false,
+                mode: FFFMode::Neovim,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Wait for scan but NOT for bigram — drop while post-scan is active
+        shared_picker.wait_for_scan(Duration::from_secs(10));
+
+        // Poll until post_scan_indexing_active is true (bigram started)
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut was_active = false;
+        loop {
+            if let Ok(guard) = shared_picker.read() {
+                if let Some(picker) = guard.as_ref() {
+                    if picker.is_post_scan_active() {
+                        was_active = true;
+                        break;
+                    }
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        if was_active {
+            caught_active += 1;
+        }
+
+        // Drop the picker while post_scan_indexing_active is set.
+        // Take it out of the shared handle first, then drop outside the lock —
+        // Drop spins until post-scan finishes, which needs the write lock for
+        // bigram install, so we can't hold it during Drop.
+        let old_picker = shared_picker.write().unwrap().take();
+        drop(old_picker); // Drop fires here — spins until post-scan exits
+
+        assert!(
+            shared_picker.read().unwrap().is_none(),
+            "round {round}: picker should be None after drop"
+        );
+    }
+
+    // The primary invariant — dropping while post-scan may be active must not
+    // crash — is exercised every round regardless. Catching the active window
+    // is timing-dependent: with a fast walker/scan the post-scan phase can
+    // complete before the poll observes it, especially on loaded CI runners.
+    // So we only warn (not fail) if no round observed it.
+    if caught_active == 0 {
+        eprintln!(
+            "warning: never observed post_scan_indexing_active=true; \
+             drop-safety was still exercised in all rounds ({caught_active}/10)"
+        );
+    }
+    eprintln!("Caught post-scan active in {caught_active}/10 rounds");
 }
