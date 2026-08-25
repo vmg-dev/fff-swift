@@ -6,8 +6,8 @@ import PackageDescription
 let localArtifactPath = "Artifacts/CFFF.xcframework"
 let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 let localArtifactURL = packageDirectory.appendingPathComponent(localArtifactPath)
-let binaryVersion = "0.2.0"
-let binaryChecksum = "e6db7565545c2b51074e7e30358300b638c8e6c5539f8596ebe9fe6ea4cd758d"
+let binaryVersion = "0.2.1"
+let binaryChecksum = "900b222ced0ee8921cc35b037309d3957c32c4675ca0d12eef3a89370c418e23"
 let cfffTarget: Target = FileManager.default.fileExists(atPath: localArtifactURL.path)
     ? .binaryTarget(name: "CFFF", path: localArtifactPath)
     : .binaryTarget(
