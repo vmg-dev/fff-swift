@@ -1,7 +1,7 @@
 # Vendored FFF source
 
 This directory vendors [FFF](https://github.com/dmtrKovalenko/fff) version
-0.10.3 at commit `e2cad2f09ea617d4c024f396f21d80e557f23a17`.
+0.10.5 at commit `459ebcdbdba094843fe5339a1a7f7dae4ced2d82`.
 
 FFF Swift modifies the vendored source to:
 
